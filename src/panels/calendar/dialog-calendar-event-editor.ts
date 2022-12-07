@@ -300,33 +300,46 @@ class DialogCalendarEventEditor extends LitElement {
   private _startDateChanged(ev: CustomEvent) {
     // Store previous event duration
     const duration = differenceInMilliseconds(this._dtend!, this._dtstart!);
-
     this._dtstart = new Date(
-      ev.detail.value + "T" + this._dtstart!.toISOString().split("T")[1]
+      `${ev.detail.value}T${this.toISOTimeString(this._dtstart!)}`
     );
 
     // Prevent that the end time can be before the start time. Try to keep the
     // duration the same.
     if (this._dtend! <= this._dtstart!) {
       const newEnd = addMilliseconds(this._dtstart, duration);
-      // en-CA locale used for date format YYYY-MM-DD
-      // en-GB locale used for 24h time format HH:MM:SS
-      this._dtend = new Date(
-        `${newEnd.toLocaleDateString("en-CA", {
-          timeZone: this.hass.config.time_zone,
-        })}T${newEnd.toLocaleTimeString("en-GB", {
-          timeZone: this.hass.config.time_zone,
-        })}`
-      );
+      this._dtend = new Date(this.toISOString(newEnd));
       this._info = this.hass.localize(
         "ui.components.calendar.event.end_auto_adjusted"
       );
     }
   }
 
+  // Convert to an ISO format compatible date string that respects the timezone
+  private toISODateString(dateValue: Date): string {
+    // en-CA locale used for date format YYYY-MM-DD
+    return dateValue.toLocaleDateString("en-CA", {
+      timeZone: this.hass.config.time_zone,
+    });
+  }
+
+  private toISOTimeString(dateValue: Date): string {
+    // en-GB locale used for 24h time format HH:MM:SS
+    return dateValue.toLocaleTimeString("en-GB", {
+      timeZone: this.hass.config.time_zone,
+    });
+  }
+
+  // Convert to an ISO format compatible date string that respects the timezone
+  private toISOString(dateValue: Date): string {
+    return `${this.toISODateString(dateValue)}T${this.toISOTimeString(
+      dateValue
+    )}`;
+  }
+
   private _endDateChanged(ev: CustomEvent) {
     this._dtend = new Date(
-      ev.detail.value + "T" + this._dtend!.toISOString().split("T")[1]
+      `${ev.detail.value}T${this.toISOTimeString(this._dtend!)}`
     );
   }
 
@@ -335,7 +348,7 @@ class DialogCalendarEventEditor extends LitElement {
     const duration = differenceInMilliseconds(this._dtend!, this._dtstart!);
 
     this._dtstart = new Date(
-      this._dtstart!.toISOString().split("T")[0] + "T" + ev.detail.value
+      `${this.toISODateString(this._dtstart!)}T${ev.detail.value}`
     );
 
     // Prevent that the end time can be before the start time. Try to keep the
@@ -357,7 +370,7 @@ class DialogCalendarEventEditor extends LitElement {
 
   private _endTimeChanged(ev: CustomEvent) {
     this._dtend = new Date(
-      this._dtend!.toISOString().split("T")[0] + "T" + ev.detail.value
+      `${this.toISODateString(this._dtend!)}T${ev.detail.value}`
     );
   }
 
