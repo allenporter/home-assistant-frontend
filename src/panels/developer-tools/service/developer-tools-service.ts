@@ -20,7 +20,7 @@ import "../../../components/ha-service-picker";
 import "../../../components/ha-yaml-editor";
 import type { HaYamlEditor } from "../../../components/ha-yaml-editor";
 import { forwardHaptic } from "../../../data/haptics";
-import { ServiceAction } from "../../../data/script";
+import { Action, StopAction, ServiceAction } from "../../../data/script";
 import {
   callExecuteScript,
   serviceCallWillDisconnect,
@@ -286,7 +286,7 @@ class HaPanelDevService extends LitElement {
     (
       serviceDomains: HomeAssistant["services"],
       domainService: string | undefined
-    ): { target: boolean; fields: any[] } => {
+    ): { target: boolean; fields: any[]; responseFields: any[] } => {
       if (!domainService) {
         return { target: false, fields: [] };
       }
@@ -300,6 +300,7 @@ class HaPanelDevService extends LitElement {
       }
       const target = "target" in serviceDomains[domain][service];
       const fields = serviceDomains[domain][service].fields;
+      const responseFields = serviceDomains[domain][service].response_fields;
       const result = Object.keys(fields).map((field) => ({
         key: field,
         ...fields[field],
@@ -308,17 +309,41 @@ class HaPanelDevService extends LitElement {
       return {
         target,
         fields: result,
+        responseFields: responseFields,
       };
     }
   );
+
+  private _serviceScriptSequence(): Action[] {
+    const responseFields = this._fields(
+      this.hass.services,
+      this._serviceData?.service
+    ).responseFields;
+    if (!responseFields) {
+      return [this._serviceData];
+    }
+    // Create a script that returns the response data from the service
+    return [
+      {
+        ...this._serviceData,
+        response_variable: "service_response",
+      } as ServiceAction,
+      data,
+      {
+        stop: "Stop",
+        response: "{{ service_response }}",
+      } as StopAction,
+    ];
+  }
 
   private async _callService(ev) {
     const button = ev.currentTarget as HaProgressButton;
     if (!this._serviceData?.service) {
       return;
     }
+    const sequence = this._serviceScriptSequence();
     try {
-      await callExecuteScript(this.hass, [this._serviceData]);
+      await callExecuteScript(this.hass, sequence);
     } catch (err: any) {
       const [domain, service] = this._serviceData.service.split(".", 2);
       if (
