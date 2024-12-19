@@ -6,6 +6,7 @@ import { classMap } from "lit/directives/class-map";
 import type { HomeAssistant } from "../types";
 import {
   runAssistPipeline,
+  startWebRtcAssistPipeline,
   type AssistPipeline,
 } from "../data/assist_pipeline";
 import { supportsFeature } from "../common/entity/supports-feature";
@@ -103,7 +104,7 @@ export class HaAssistChat extends LitElement {
             )
           : true);
     const supportsMicrophone = AudioRecorder.isSupported;
-    const supportsSTT = this.pipeline?.stt_engine;
+    const supportsSTT = true;   // this.pipeline?.stt_engine;
 
     return html`
       ${controlHA
@@ -296,82 +297,81 @@ export class HaAssistChat extends LitElement {
       who: "hass",
       text: "…",
     };
+
+    let hook = (event) => {
+      console.log("pipeline event: " + event.type);
+      if (event.type === "run-start") {
+        this._stt_binary_handler_id =
+          event.data.runner_data.stt_binary_handler_id;
+      }
+
+      // When we start STT stage, the WS has a binary handler
+      if (event.type === "stt-start" && this._audioBuffer) {
+        // Send the buffer over the WS to the STT engine.
+        for (const buffer of this._audioBuffer) {
+          this._sendAudioChunk(buffer);
+        }
+        this._audioBuffer = undefined;
+      }
+
+      // Stop recording if the server is done with STT stage
+      if (event.type === "stt-end") {
+        this._stt_binary_handler_id = undefined;
+        this._stopListening();
+        userMessage.text = event.data.stt_output.text;
+        this.requestUpdate("_conversation");
+        // To make sure the answer is placed at the right user text, we add it before we process it
+        this._addMessage(hassMessage);
+      }
+
+      if (event.type === "intent-end") {
+        this._conversationId = event.data.intent_output.conversation_id;
+        const plain = event.data.intent_output.response.speech?.plain;
+        if (plain) {
+          hassMessage.text = plain.speech;
+        }
+        this.requestUpdate("_conversation");
+      }
+
+      if (event.type === "tts-end") {
+        const url = event.data.tts_output.url;
+        this._audio = new Audio(url);
+        this._audio.play();
+        this._audio.addEventListener("ended", this._unloadAudio);
+        this._audio.addEventListener("pause", this._unloadAudio);
+        this._audio.addEventListener("canplaythrough", this._playAudio);
+        this._audio.addEventListener("error", this._audioError);
+      }
+
+      if (event.type === "run-end") {
+        this._stt_binary_handler_id = undefined;
+        unsub();
+      }
+
+      if (event.type === "error") {
+        this._stt_binary_handler_id = undefined;
+        if (userMessage.text === "…") {
+          userMessage.text = event.data.message;
+          userMessage.error = true;
+        } else {
+          hassMessage.text = event.data.message;
+          hassMessage.error = true;
+        }
+        this._stopListening();
+        this.requestUpdate("_conversation");
+        unsub();
+      }
+    };
+
     // To make sure the answer is placed at the right user text, we add it before we process it
     try {
-      const unsub = await runAssistPipeline(
+      console.log("run pipeline start listening");
+      const webRtcPipeline = await startWebRtcAssistPipeline(
         this.hass,
-        (event) => {
-          if (event.type === "run-start") {
-            this._stt_binary_handler_id =
-              event.data.runner_data.stt_binary_handler_id;
-          }
-
-          // When we start STT stage, the WS has a binary handler
-          if (event.type === "stt-start" && this._audioBuffer) {
-            // Send the buffer over the WS to the STT engine.
-            for (const buffer of this._audioBuffer) {
-              this._sendAudioChunk(buffer);
-            }
-            this._audioBuffer = undefined;
-          }
-
-          // Stop recording if the server is done with STT stage
-          if (event.type === "stt-end") {
-            this._stt_binary_handler_id = undefined;
-            this._stopListening();
-            userMessage.text = event.data.stt_output.text;
-            this.requestUpdate("_conversation");
-            // To make sure the answer is placed at the right user text, we add it before we process it
-            this._addMessage(hassMessage);
-          }
-
-          if (event.type === "intent-end") {
-            this._conversationId = event.data.intent_output.conversation_id;
-            const plain = event.data.intent_output.response.speech?.plain;
-            if (plain) {
-              hassMessage.text = plain.speech;
-            }
-            this.requestUpdate("_conversation");
-          }
-
-          if (event.type === "tts-end") {
-            const url = event.data.tts_output.url;
-            this._audio = new Audio(url);
-            this._audio.play();
-            this._audio.addEventListener("ended", this._unloadAudio);
-            this._audio.addEventListener("pause", this._unloadAudio);
-            this._audio.addEventListener("canplaythrough", this._playAudio);
-            this._audio.addEventListener("error", this._audioError);
-          }
-
-          if (event.type === "run-end") {
-            this._stt_binary_handler_id = undefined;
-            unsub();
-          }
-
-          if (event.type === "error") {
-            this._stt_binary_handler_id = undefined;
-            if (userMessage.text === "…") {
-              userMessage.text = event.data.message;
-              userMessage.error = true;
-            } else {
-              hassMessage.text = event.data.message;
-              hassMessage.error = true;
-            }
-            this._stopListening();
-            this.requestUpdate("_conversation");
-            unsub();
-          }
-        },
-        {
-          start_stage: "stt",
-          end_stage: this.pipeline?.tts_engine ? "tts" : "intent",
-          input: { sample_rate: this._audioRecorder.sampleRate! },
-          pipeline: this.pipeline?.id,
-          conversation_id: this._conversationId,
-        }
+        hook,
       );
     } catch (err: any) {
+      console.log("Error starting pipeline", err);
       await showAlertDialog(this, {
         title: "Error starting pipeline",
         text: err.message || err,
@@ -380,6 +380,13 @@ export class HaAssistChat extends LitElement {
     } finally {
       this._processing = false;
     }
+    webRtcPipeline.sendAudio({
+      start_stage: "stt",
+      end_stage: this.pipeline?.tts_engine ? "tts" : "intent",
+      input: { sample_rate: this._audioRecorder.sampleRate! },
+      pipeline: this.pipeline?.id,
+      conversation_id: this._conversationId,
+    });
   }
 
   private _stopListening() {
@@ -438,41 +445,55 @@ export class HaAssistChat extends LitElement {
     };
     // To make sure the answer is placed at the right user text, we add it before we process it
     this._addMessage(message);
+
+    const hook = (event) => {
+      console.log("pipeline event: " + event.type);
+      if (event.type === "intent-end") {
+        this._conversationId = event.data.intent_output.conversation_id;
+        const plain = event.data.intent_output.response.speech?.plain;
+        if (plain) {
+          message.text = plain.speech;
+        }
+        this.requestUpdate("_conversation");
+        unsub();
+      }
+      if (event.type === "error") {
+        message.text = event.data.message;
+        message.error = true;
+        this.requestUpdate("_conversation");
+        unsub();
+      }
+    };
+
+    let webRtcPipeline = null;
     try {
-      const unsub = await runAssistPipeline(
+      console.log("run pipeline _processText");
+      webRtcPipeline = await startWebRtcAssistPipeline(
         this.hass,
-        (event) => {
-          if (event.type === "intent-end") {
-            this._conversationId = event.data.intent_output.conversation_id;
-            const plain = event.data.intent_output.response.speech?.plain;
-            if (plain) {
-              message.text = plain.speech;
-            }
-            this.requestUpdate("_conversation");
-            unsub();
-          }
-          if (event.type === "error") {
-            message.text = event.data.message;
-            message.error = true;
-            this.requestUpdate("_conversation");
-            unsub();
-          }
-        },
         {
-          start_stage: "intent",
-          input: { text },
-          end_stage: "intent",
           pipeline: this.pipeline?.id,
           conversation_id: this._conversationId,
-        }
-      );
-    } catch {
+        },
+        hook,
+      )
+    } catch (err: any) {
+      console.log("Error starting pipeline: " + err);
       message.text = this.hass.localize("ui.dialogs.voice_command.error");
       message.error = true;
       this.requestUpdate("_conversation");
+      return;
     } finally {
       this._processing = false;
     }
+    webRtcPipeline.sendData(
+      {
+        start_stage: "intent",
+        input: { text },
+        end_stage: "intent",
+        pipeline: this.pipeline?.id,
+        conversation_id: this._conversationId,
+      }
+    );
   }
 
   static get styles(): CSSResultGroup {
