@@ -349,6 +349,7 @@ export class HaAssistChat extends LitElement {
             this._stt_binary_handler_id = undefined;
             unsub();
           }
+
           if (event.type === "error") {
             this._stt_binary_handler_id = undefined;
             if (userMessage.text === "…") {
@@ -369,7 +370,8 @@ export class HaAssistChat extends LitElement {
           input: { sample_rate: this._audioRecorder.sampleRate! },
           pipeline: this.pipeline?.id,
           conversation_id: this._conversationId,
-        });
+        }
+      );
     } catch (err: any) {
       await showAlertDialog(this, {
         title: "Error starting pipeline",
@@ -437,25 +439,6 @@ export class HaAssistChat extends LitElement {
     };
     // To make sure the answer is placed at the right user text, we add it before we process it
     this._addMessage(message);
-
-    const hook = (event) => {
-      console.log("pipeline event: " + event.type);
-      if (event.type === "intent-end") {
-        this._conversationId = event.data.intent_output.conversation_id;
-        const plain = event.data.intent_output.response.speech?.plain;
-        if (plain) {
-          message.text = plain.speech;
-        }
-        this.requestUpdate("_conversation");
-        unsub();
-      }
-      if (event.type === "error") {
-        message.text = event.data.message;
-        message.error = true;
-        this.requestUpdate("_conversation");
-        unsub();
-      }
-    };
 
     try {
       const unsub = await runAssistPipeline(
