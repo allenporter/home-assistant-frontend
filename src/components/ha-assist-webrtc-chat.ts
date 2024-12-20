@@ -5,8 +5,7 @@ import { customElement, property, query, state } from "lit/decorators";
 import { classMap } from "lit/directives/class-map";
 import type { HomeAssistant } from "../types";
 import {
-  runAssistPipeline,
-  startWebRtcAssistPipeline,
+  webRtcOffer,
   type AssistPipeline,
 } from "../data/assist_pipeline";
 import { supportsFeature } from "../common/entity/supports-feature";
@@ -21,11 +20,12 @@ import { showAlertDialog } from "../dialogs/generic/show-dialog-box";
 interface AssistMessage {
   who: string;
   text?: string | TemplateResult;
+  audio?: HTMLAudioElement;
   error?: boolean;
 }
 
-@customElement("ha-assist-chat")
-export class HaAssistChat extends LitElement {
+@customElement("ha-assist-webrtc-chat")
+export class HaAssistWebRTCChat extends LitElement {
   @property({ attribute: false }) public hass!: HomeAssistant;
 
   @property({ attribute: false }) public pipeline?: AssistPipeline;
@@ -45,13 +45,19 @@ export class HaAssistChat extends LitElement {
 
   private _conversationId: string | null = null;
 
-  private _audioRecorder?: AudioRecorder;
+  private _isListening = false;
+
+  private _clientAudioStream?: MediaStream;
 
   private _audioBuffer?: Int16Array[];
 
-  private _audio?: HTMLAudioElement;
-
   private _stt_binary_handler_id?: number | null;
+
+  private _peerConnection?: RTCPeerConnection;
+
+  private _dataChannel?: RTCDataChannel;
+
+  private _remoteStream?: MediaStream;
 
   protected willUpdate(changedProperties: PropertyValues): void {
     if (!this.hasUpdated || changedProperties.has("pipeline")) {
@@ -66,14 +72,17 @@ export class HaAssistChat extends LitElement {
 
   protected firstUpdated(changedProperties: PropertyValues): void {
     super.firstUpdated(changedProperties);
-    if (
-      this.startListening &&
-      this.pipeline &&
-      this.pipeline.stt_engine &&
-      AudioRecorder.isSupported
-    ) {
-      this._toggleListening();
+    if (this.pipeline) {
+      this._startConnection();
     }
+    // if (
+    //   this.startListening &&
+    //   this.pipeline &&
+    //   this.pipeline.stt_engine &&
+    //   AudioRecorder.isSupported
+    // ) {
+    //   this._toggleListening();
+    // }
     setTimeout(() => this._messageInput.focus(), 0);
   }
 
@@ -86,9 +95,12 @@ export class HaAssistChat extends LitElement {
 
   public disconnectedCallback() {
     super.disconnectedCallback();
-    this._audioRecorder?.close();
-    this._audioRecorder = undefined;
-    this._audio?.pause();
+    this._cleanUp();
+    if (this._clientAudioStream) {
+      this._clientAudioStream.getTracks().forEach((track) => track.stop());
+      this._clientAudioStream = undefined;
+    }
+    this._pauseAudio();
     this._conversation = [];
     this._conversationId = null;
   }
@@ -104,7 +116,7 @@ export class HaAssistChat extends LitElement {
             )
           : true);
     const supportsMicrophone = AudioRecorder.isSupported;
-    const supportsSTT = this.pipeline?.stt_engine;
+    const supportsSTT = true;   // this.pipeline?.stt_engine;
 
     return html`
       ${controlHA
@@ -112,17 +124,19 @@ export class HaAssistChat extends LitElement {
         : html`
             <ha-alert>
               ${this.hass.localize(
-                "ui.dialogs.voice_command.conversation_no_control"
-              )}
+          "ui.dialogs.voice_command.conversation_no_control"
+        )}
             </ha-alert>
           `}
       <div class="messages">
         <div class="messages-container" id="scroll-container">
           ${this._conversation!.map(
-            // New lines matter for messages
-            // prettier-ignore
-            (message) => html`
-                <div class="message ${classMap({ error: !!message.error, [message.who]: true })}">${message.text}</div>
+          // New lines matter for messages
+          // prettier-ignore
+          (message) => html`
+                ${message.audio
+                  ? html`<div class="message ${classMap({ error: !!message.error, [message.who]: true })}">${message.audio}</div>`
+                  : html`<div class="message ${classMap({ error: !!message.error, [message.who]: true })}">${message.text}</div>`}
               `
           )}
         </div>
@@ -150,7 +164,7 @@ export class HaAssistChat extends LitElement {
                   </ha-icon-button>
                 `
               : html`
-                  ${this._audioRecorder?.active
+                  ${this._isListening
                     ? html`
                         <div class="bouncer">
                           <div class="double-bounce1"></div>
@@ -183,6 +197,23 @@ export class HaAssistChat extends LitElement {
         </ha-textfield>
       </div>
     `;
+  }
+
+
+  private _startTimer() {
+    if (!__DEV__) {
+      return;
+    }
+    // eslint-disable-next-line no-console
+    console.log("WebRTC start");
+  }
+
+  private _stopTimer() {
+    if (!__DEV__) {
+      return;
+    }
+    // eslint-disable-next-line no-console
+    console.log("WebRTC end");
   }
 
   private _scrollMessagesBottom() {
@@ -231,7 +262,7 @@ export class HaAssistChat extends LitElement {
       this._showNotSupportedMessage();
       return;
     }
-    if (!this._audioRecorder?.active) {
+    if (!this._isListening) {
       this._startListening();
     } else {
       this._stopListening();
@@ -270,166 +301,230 @@ export class HaAssistChat extends LitElement {
     });
   }
 
-  private async _startListening() {
-    this._processing = true;
-    this._audio?.pause();
-    if (!this._audioRecorder) {
-      this._audioRecorder = new AudioRecorder((audio) => {
-        if (this._audioBuffer) {
-          this._audioBuffer.push(audio);
-        } else {
-          this._sendAudioChunk(audio);
-        }
-      });
+  private _logEvent(msg: string, ...args: unknown[]) {
+    if (!__DEV__) {
+      return;
     }
-    this._stt_binary_handler_id = undefined;
-    this._audioBuffer = [];
-    const userMessage: AssistMessage = {
-      who: "user",
-      text: "…",
-    };
-    await this._audioRecorder.start();
+    // eslint-disable-next-line no-console
+    console.log(msg, ...args);
+  }
 
-    this._addMessage(userMessage);
-    this.requestUpdate("_audioRecorder");
-
-    const hassMessage: AssistMessage = {
-      who: "hass",
-      text: "…",
+  private async _startConnection() {
+    this._cleanUp();
+    if (typeof RTCPeerConnection === "undefined") {
+      throw new Error("WebRTC not supported in this browser");
+    }
+    this._startTimer();
+    this._peerConnection = new RTCPeerConnection();
+    this._dataChannel = this._peerConnection.createDataChannel("assist");
+    this._dataChannel.onmessage = this._dataChannelMessage;
+    this._dataChannel.ondatachannelopen = this._dataChannelOpen;
+    this._peerConnection.onconnectionstatechange = () => {
+      const state = this._peerConnection.connectionState;
+      this._logEvent("Connection state changed:", state);
+      if (state === "failed") {
+        console.error("Connection failed. Cleaning up.");
+        this._cleanUp();
+      }
     };
-    // To make sure the answer is placed at the right user text, we add it before we process it
+
+    // Setup callbacks to render remote stream once media tracks are discovered.
+    this._remoteStream = new MediaStream();
+    this._peerConnection.ontrack = this._addTrack;
+    // TODO: Check pipeline capabilities
+    this._peerConnection.addTransceiver("audio", { direction: "recvonly" });
+
+
+    // Open the microphone but don't start listening yet. Add the tracks to the
+    // media stream.
+    this._clientAudioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    this._clientAudioStream.getTracks().forEach((track) => { track.enabled = false; });
+    this._isListening = false;
+    for (const track of this._clientAudioStream.getAudioTracks()) {
+      this._logEvent("Adding audio track to peer connection", track);
+      this._peerConnection?.addTrack(track);
+    }
+
+    const offerOptions: RTCOfferOptions = {
+      offerToReceiveAudio: true,
+      offerToReceiveVideo: false,
+    };
+    const offer: RTCSessionDescriptionInit = await this._peerConnection.createOffer(offerOptions);
+    await this._peerConnection.setLocalDescription(offer);
+
+    this._logEvent("Sending offer");
+    let offerEvent = null;
     try {
-      const unsub = await runAssistPipeline(
+      offerEvent = await webRtcOffer(
         this.hass,
-        (event) => {
-          if (event.type === "run-start") {
-            this._stt_binary_handler_id =
-              event.data.runner_data.stt_binary_handler_id;
-          }
-
-          // When we start STT stage, the WS has a binary handler
-          if (event.type === "stt-start" && this._audioBuffer) {
-            // Send the buffer over the WS to the STT engine.
-            for (const buffer of this._audioBuffer) {
-              this._sendAudioChunk(buffer);
-            }
-            this._audioBuffer = undefined;
-          }
-
-          // Stop recording if the server is done with STT stage
-          if (event.type === "stt-end") {
-            this._stt_binary_handler_id = undefined;
-            this._stopListening();
-            userMessage.text = event.data.stt_output.text;
-            this.requestUpdate("_conversation");
-            // To make sure the answer is placed at the right user text, we add it before we process it
-            this._addMessage(hassMessage);
-          }
-
-          if (event.type === "intent-end") {
-            this._conversationId = event.data.intent_output.conversation_id;
-            const plain = event.data.intent_output.response.speech?.plain;
-            if (plain) {
-              hassMessage.text = plain.speech;
-            }
-            this.requestUpdate("_conversation");
-          }
-
-          if (event.type === "tts-end") {
-            const url = event.data.tts_output.url;
-            this._audio = new Audio(url);
-            this._audio.play();
-            this._audio.addEventListener("ended", this._unloadAudio);
-            this._audio.addEventListener("pause", this._unloadAudio);
-            this._audio.addEventListener("canplaythrough", this._playAudio);
-            this._audio.addEventListener("error", this._audioError);
-          }
-
-          if (event.type === "run-end") {
-            this._stt_binary_handler_id = undefined;
-            unsub();
-          }
-          if (event.type === "error") {
-            this._stt_binary_handler_id = undefined;
-            if (userMessage.text === "…") {
-              userMessage.text = event.data.message;
-              userMessage.error = true;
-            } else {
-              hassMessage.text = event.data.message;
-              hassMessage.error = true;
-            }
-            this._stopListening();
-            this.requestUpdate("_conversation");
-            unsub();
-          }
-        },
-        {
-          start_stage: "stt",
-          end_stage: this.pipeline?.tts_engine ? "tts" : "intent",
-          input: { sample_rate: this._audioRecorder.sampleRate! },
-          pipeline: this.pipeline?.id,
-          conversation_id: this._conversationId,
-        });
+        this.pipeline!.id,
+        offer.sdp,
+      )
     } catch (err: any) {
       await showAlertDialog(this, {
         title: "Error starting pipeline",
         text: err.message || err,
       });
-      this._stopListening();
-    } finally {
-      this._processing = false;
+      this._cleanUp();
+      return;
     }
+    this._logEvent("Received answer: " + offerEvent.answer);
+
+    // Initiate the stream
+    const remoteDesc = new RTCSessionDescription({
+      type: "answer",
+      sdp: offerEvent.answer,
+    });
+    try {
+      this._logEvent("start setRemoteDescription", remoteDesc);
+      await this._peerConnection.setRemoteDescription(remoteDesc);
+    } catch (err: any) {
+      this._error = "Failed to connect WebRTC stream: " + err.message;
+      this._cleanUp();
+    }
+    this._logEvent("end setRemoteDescription");
+  }
+
+  private _addTrack = async (event: RTCTrackEvent) => {
+    if (!this._remoteStream) {
+      return;
+    }
+    this._logEvent("Adding track to remote stream: " + event.track.kind);
+    this._remoteStream.addTrack(event.track);
+    if (!this.hasUpdated) {
+      await this.updateComplete;
+    }
+    this._stopTimer();
+  };
+
+  private _setAudioTrack(audio: HTMLAudioElement) {
+    this._logEvent("Setting audio track");
+    if (!this._remoteStream) {
+      return;
+    }
+    audio.srcObject = this._remoteStream;
+  }
+
+  private _connectionError = () => {
+    showAlertDialog(this, { title: "WebRTC not connected." });
+    // TODO: Remove all audio
+    // this._audio?.removeAttribute("src");
+  };
+
+  private _isConnected() {
+    return this._dataChannel && this._dataChannel.readyState === "open";
+  }
+
+  private _dataChannelOpen() {
+    this._logEvent("Data channel opened.");
+    this._connected = true;
+  }
+
+  private _dataChannelMessage = (ev: MessageEvent) => {
+    const event = JSON.parse(new TextDecoder().decode(ev.data));
+    console.log("dataChannel message", event);
+    if (event.type === "intent-end") {
+      this._conversationId = event.data.intent_output.conversation_id;
+      const plain = event.data.intent_output.response.speech?.plain;
+      if (plain) {
+        const hassMessage = this._conversation.at(-1);
+        hassMessage.text = plain.speech;
+      }
+      this.requestUpdate("_conversation");
+    } else if (event.type === "error") {
+      this._stt_binary_handler_id = undefined;
+      const lastMessage = this._conversation.at(-1);
+      lastMessage.text = event.data.message;
+      lastMessage.error = true;
+      this._stopListening();
+      this.requestUpdate("_conversation");
+    }
+  }
+
+
+  private async _startListening() {
+    if (!this._isConnected()) {
+      this._connectionError();
+      return;
+    }
+
+    this._processing = true;
+    this._pauseAudio();
+
+    // Open the microphone
+    for (const track of this._clientAudioStream!.getAudioTracks()) {
+      track.enabled = true;
+    }
+
+    const audioEl = new Audio();
+    const userMessage: AssistMessage = {
+      who: "user",
+      audio: audioEl,
+      text: "…",
+    };
+    audioEl.srcObject = this._clientAudioStream!;
+    this._addMessage(userMessage);
+    this.requestUpdate("_isListening");
+
+    // Prepare to receive audio from the server
+    const outputAudioEl = new Audio();
+    outputAudioEl.playsInline = true;
+    outputAudioEl.autoplay = true;
+    const hassMessage: AssistMessage = {
+      who: "hass",
+      audio: outputAudioEl,
+    };
+    this._setAudioTrack(outputAudioEl);
+  }
+
+  private isDataChannelOpen() {
+    return this._dataChannel?.readyState === "open";
+  }
+
+  private _cleanUp() {
+    if (this._peerConnection) {
+      this._peerConnection.close();
+      this._peerConnection = null;
+    }
+    if (this._audio()) {
+      this._audio().removeAttribute("src");
+    }
+    this._stopTimer();
   }
 
   private _stopListening() {
-    this._audioRecorder?.stop();
-    this.requestUpdate("_audioRecorder");
-    // We're currently STTing, so finish audio
-    if (this._stt_binary_handler_id) {
-      if (this._audioBuffer) {
-        for (const chunk of this._audioBuffer) {
-          this._sendAudioChunk(chunk);
-        }
-      }
-      // Send empty message to indicate we're done streaming.
-      this._sendAudioChunk(new Int16Array());
-      this._stt_binary_handler_id = undefined;
-    }
-    this._audioBuffer = undefined;
+    this._clientAudioStream.getTracks().forEach((track) => { track.enabled = false; });
+    this._isListening = false;
+    this.requestUpdate("_isListening");
   }
 
-  private _sendAudioChunk(chunk: Int16Array) {
-    this.hass.connection.socket!.binaryType = "arraybuffer";
-
-    // eslint-disable-next-line eqeqeq
-    if (this._stt_binary_handler_id == undefined) {
-      return;
+  // Returns an audio element if the last active message is Home Assistant
+  private _audio(): HTMLAudioElement | null {
+    const conversation = this._conversation.at(-1);
+    if (conversation && conversation.who === "hass" && conversation.audio) {
+      return conversation.audio;
     }
-    // Turn into 8 bit so we can prefix our handler ID.
-    const data = new Uint8Array(1 + chunk.length * 2);
-    data[0] = this._stt_binary_handler_id;
-    data.set(new Uint8Array(chunk.buffer), 1);
-
-    this.hass.connection.socket!.send(data);
+    return null;
   }
 
-  private _playAudio = () => {
-    this._audio?.play();
-  };
-
-  private _audioError = () => {
-    showAlertDialog(this, { title: "Error playing audio." });
-    this._audio?.removeAttribute("src");
-  };
+  private _pauseAudio() {
+    if (this._audio()) {
+      this._audio()?.pause();
+    }
+  }
 
   private _unloadAudio = () => {
-    this._audio?.removeAttribute("src");
-    this._audio = undefined;
+    this._audio()?.removeAttribute("src");
   };
 
   private async _processText(text: string) {
+    if (!this._isConnected()) {
+      this._connectionError();
+      return;
+    }
+
     this._processing = true;
-    this._audio?.pause();
+    this._pauseAudio();
     this._addMessage({ who: "user", text });
     const message: AssistMessage = {
       who: "hass",
@@ -439,7 +534,7 @@ export class HaAssistChat extends LitElement {
     this._addMessage(message);
 
     const hook = (event) => {
-      console.log("pipeline event: " + event.type);
+      this._logEvent("pipeline event: " + event.type);
       if (event.type === "intent-end") {
         this._conversationId = event.data.intent_output.conversation_id;
         const plain = event.data.intent_output.response.speech?.plain;
@@ -456,42 +551,16 @@ export class HaAssistChat extends LitElement {
         unsub();
       }
     };
-
-    try {
-      const unsub = await runAssistPipeline(
-        this.hass,
-        (event) => {
-          if (event.type === "intent-end") {
-            this._conversationId = event.data.intent_output.conversation_id;
-            const plain = event.data.intent_output.response.speech?.plain;
-            if (plain) {
-              message.text = plain.speech;
-            }
-            this.requestUpdate("_conversation");
-            unsub();
-          }
-          if (event.type === "error") {
-            message.text = event.data.message;
-            message.error = true;
-            this.requestUpdate("_conversation");
-            unsub();
-          }
-        },
-        {
-          start_stage: "intent",
-          input: { text },
-          end_stage: "intent",
-          pipeline: this.pipeline?.id,
-          conversation_id: this._conversationId,
-        }
-      );
-    } catch {
-      message.text = this.hass.localize("ui.dialogs.voice_command.error");
-      message.error = true;
-      this.requestUpdate("_conversation");
-    } finally {
-      this._processing = false;
+    const packet = {
+      start_stage: "intent",
+      input: { text },
+      end_stage: this.pipeline?.tts_engine ? "tts" : "intent",
+      pipeline: this.pipeline?.id,
+      conversation_id: this._conversationId,
     }
+
+    this._logEvent("Sending input text", packet);
+    this._dataChannel!.send(JSON.stringify(packet));
   }
 
   static get styles(): CSSResultGroup {
@@ -500,7 +569,7 @@ export class HaAssistChat extends LitElement {
         flex: 1;
         display: flex;
         flex-direction: column;
-        min-height: var(--ha-assist-chat-min-height, 415px);
+        min-height: var(--ha-assist-webrtc-chat-min-height, 415px);
       }
       ha-textfield {
         display: block;
@@ -653,6 +722,6 @@ export class HaAssistChat extends LitElement {
 
 declare global {
   interface HTMLElementTagNameMap {
-    "ha-assist-chat": HaAssistChat;
+    "ha-assist-webrtc-chat": HaAssistWebRTCChat;
   }
 }

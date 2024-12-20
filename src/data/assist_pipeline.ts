@@ -3,6 +3,7 @@ import type { HomeAssistant } from "../types";
 import type { ConversationResult } from "./conversation";
 import type { ResolvedMediaSource } from "./media_source";
 import type { SpeechMetadata } from "./stt";
+import type { WebRtcCandidate, WebRtcOfferEvent } from "./camera";
 
 export interface AssistPipeline {
   id: string;
@@ -383,136 +384,13 @@ export const listAssistDevices = (hass: HomeAssistant) =>
   });
 
 
-export const startWebRtcAssistPipeline = async (
+export const webRtcOffer = (
   hass: HomeAssistant,
-  callback: (event: PipelineRunEvent) => void,
-) => {
-  // Browser support required for WebRTC
-  if (typeof RTCPeerConnection === "undefined") {
-    throw new Error("WebRTC not supported in this browser");
-  }
-  const config = {
-    sdpSemantics: 'unified-plan',
-    iceServers: [
-        {
-            urls: ['stun:stun1.l.google.com:19302', 'stun:stun3.l.google.com:19302']
-        }
-    ]
-}
-
-
-  let peerConnection = new RTCPeerConnection(config);
-  let channel = peerConnection.createDataChannel("chat");
-  channel.onopen = () => {
-    console.log("datachannel open");
-  };
-  channel.onclose = () => {
-    console.log("datachannel close");
-  };
-  channel.onmessage = (event) => {
-    console.log("datachannel message", event.data);
-    callback(event)
-  };
-  channel.onstatechange = () => {
-    console.log("datachannel state:", channel.readyState);
-  };
-  peerConnection.ondatachannel = (event) => {
-    console.log("datachannel Received ");
-    const receiveChannel = event.channel;
-    receiveChannel.onmessage = (event) => {
-      console.log("ondatachannel message:", event.data);
-      callback(event);
-    };
-  };
-  peerConnection.onsignalingstatechange = (ev) => {
-    switch ((ev.target as RTCPeerConnection).signalingState) {
-      case "stable":
-        console.log("Connection established");
-        break;
-      default:
-        console.log(
-          "Signaling state changed",
-          (ev.target as RTCPeerConnection).signalingState
-        );
-    }
-  };
-  peerConnection.oniceconnectionstatechange = () => {
-    console.log("ICE connection state changed:", peerConnection.iceConnectionState);
-    if (peerConnection.iceConnectionState === "failed") {
-      console.error("ICE connection failed. Closing peer connection.");
-      peerConnection.close();
-    }
-  };
-  peerConnection.onconnectionstatechange = () => {
-    console.log("Connection state changed:", peerConnection.connectionState);
-    if (peerConnection.connectionState === "failed") {
-      console.error("Connection failed. Cleaning up.");
-      peerConnection.close();
-    }
-  };
-  // Setup callbacks to render remote stream once media tracks are discovered.
-  let remoteStream = new MediaStream();
-  const addTrack = async (event: RTCTrackEvent) => {
-    console.log("Track added: " + event.track.kind);
-    remoteStream.addTrack(event.track);
-  };
-  peerConnection.ontrack = addTrack;
-  peerConnection.addTransceiver("audio", { direction: "sendrecv" });
-
-  const offerOptions: RTCOfferOptions = {
-    offerToReceiveAudio: true,
-    offerToReceiveVideo: false,
-  };
-
-  console.log("start createOffer", offerOptions);
-  const offer: RTCSessionDescriptionInit =
-    await peerConnection.createOffer(offerOptions);
-
-  console.log("end createOffer", offer);
-  console.log("start setLocalDescription");
-  await peerConnection.setLocalDescription(offer);
-  console.log("end setLocalDescription");
-
-  const answer = await hass.callWS<string>({
-    type: "assist_pipeline/run_webrtc",
-    "offer_sdp": offer.sdp,
+  pipeline: string,
+  offer: string,
+) =>
+  hass.callWS<WebRtcOfferEvent>({
+    type: "assist_pipeline/webrtc/offer",
+    pipeline,
+    offer,
   });
-  console.log("Received answer: " + answer);
-
-  // Initiate the stream with the remote device
-  const remoteDesc = new RTCSessionDescription({
-    type: "answer",
-    sdp: answer,
-  });
-  try {
-    console.log("start setRemoteDescription", remoteDesc);
-    await peerConnection.setRemoteDescription(remoteDesc);
-  } catch (err: any) {
-    console.log("Failed to connect WebRTC stream: " + err.message);
-    peerConnection.close();
-    throw err;
-  }
-  let p = new Promise(function (resolve, event) {
-    setTimeout(() => {
-      console.log("Timeout");
-      resolve();
-    }, 5000);
-  });
-  console.log("end setRemoteDescription - connection state: " + peerConnection.connectionState);
-  await p;
-  console.log("end setRemoteDescription - connection state: " + peerConnection.connectionState);
-  return {
-    sendData: (message: string) => {
-      if (channel.readyState === "open") {
-        console.log("Sending text: " + message);
-        channel.send(message);
-      } else {
-        console.error("Cannot send data. DataChannel is not open. Current state:", channel.readyState);
-      }
-    },
-    sendAudio: (message: string) => {
-      console.log("Sending audio")
-      channel.send(message);
-    }
-  }
-}

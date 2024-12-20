@@ -19,6 +19,7 @@ import "../../components/ha-icon-button";
 import "../../components/ha-list-item";
 import "../../components/ha-alert";
 import "../../components/ha-assist-chat";
+import "../../components/ha-assist-webrtc-chat";
 import "../../components/ha-circular-progress";
 import type { AssistPipeline } from "../../data/assist_pipeline";
 import {
@@ -166,12 +167,12 @@ export class HaVoiceCommandDialog extends LitElement {
 
         ${this._pipeline
           ? html`
-              <ha-assist-chat
+              <ha-assist-webrtc-chat
                 .hass=${this.hass}
                 .pipeline=${this._pipeline}
                 .startListening=${this._startListening}
               >
-              </ha-assist-chat>
+              </ha-assist-webrtc-chat>
             `
           : html`<div class="pipelines-loading">
               <ha-circular-progress
