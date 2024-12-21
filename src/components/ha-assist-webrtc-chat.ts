@@ -1,6 +1,6 @@
 import type { CSSResultGroup, PropertyValues, TemplateResult } from "lit";
 import { css, LitElement, html, nothing } from "lit";
-import { mdiAlertCircle, mdiMicrophone, mdiSend } from "@mdi/js";
+import { mdiAlertCircle, mdiMicrophone, mdiSend, mdiVolumeMedium} from "@mdi/js";
 import { customElement, property, query, state } from "lit/decorators";
 import { classMap } from "lit/directives/class-map";
 import type { HomeAssistant } from "../types";
@@ -135,7 +135,14 @@ export class HaAssistWebRTCChat extends LitElement {
           // prettier-ignore
           (message) => html`
                 ${message.audio
-                  ? html`<div class="message ${classMap({ error: !!message.error, [message.who]: true })}">${message.audio}</div>`
+                  ? html`
+                      <div class="message ${classMap({ error: !!message.error, [message.who]: true })}">
+                      <ha-svg-icon
+                        .path=${mdiVolumeMedium}
+                      ></ha-svg-icon>
+                      ${message.audio}
+                      </div>
+                  `
                   : html`<div class="message ${classMap({ error: !!message.error, [message.who]: true })}">${message.text}</div>`}
               `
           )}
@@ -468,8 +475,7 @@ export class HaAssistWebRTCChat extends LitElement {
 
     // Prepare to receive audio from the server
     const outputAudioEl = new Audio();
-    outputAudioEl.playsInline = true;
-    outputAudioEl.autoplay = true;
+    outputAudioEl.controls = true;
     const hassMessage: AssistMessage = {
       who: "hass",
       audio: outputAudioEl,
@@ -526,10 +532,18 @@ export class HaAssistWebRTCChat extends LitElement {
     this._processing = true;
     this._pauseAudio();
     this._addMessage({ who: "user", text });
+
+    // Prepare to receive audio from the server
+    const outputAudioEl = new Audio();
+    outputAudioEl.playsInline = true;
+    outputAudioEl.autoplay = true;
     const message: AssistMessage = {
       who: "hass",
-      text: "…",
+      audio: outputAudioEl,
     };
+    this._setAudioTrack(outputAudioEl);
+
+
     // To make sure the answer is placed at the right user text, we add it before we process it
     this._addMessage(message);
 
@@ -560,6 +574,7 @@ export class HaAssistWebRTCChat extends LitElement {
     }
 
     this._logEvent("Sending input text", packet);
+
     this._dataChannel!.send(JSON.stringify(packet));
   }
 
